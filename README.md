@@ -88,7 +88,14 @@ This will:
 7. Verify final balances against initial - cumulative fees
 8. Write CSV reports and print comparison summary
 
-### 3. Run a single scenario
+### 3. Run a single wallet
+
+```bash
+cargo run -- run-old   # Old wallet only (minotari_console_wallet via gRPC)
+cargo run -- run-new   # New wallet only (minotari-cli)
+```
+
+### 4. Run a single scenario
 
 ```bash
 cargo run -- run pool-payout
@@ -104,13 +111,29 @@ Available scenarios:
 | `fragmentation` | Cascade split into 500 UTXOs → test aggregation sends | 10,000 tXTM |
 | `lock-contention` | 10/25/50 rapid sequential sends measuring contention | 10,000 tXTM |
 
-### 4. Consolidate UTXOs after testing
+### 5. Run baseline only
+
+```bash
+cargo run -- baseline
+```
+
+Checks connectivity, records initial balances, and sends a single warm-up transaction from each wallet.
+
+### 6. Consolidate UTXOs after testing
 
 ```bash
 cargo run -- consolidate
 ```
 
 Sweeps all UTXOs to a single output per wallet, polls for mining confirmation, and reports final balances.
+
+### 7. Drain address pool funds
+
+```bash
+cargo run -- drain
+```
+
+Scans the address pool sink wallets for received funds, then sweeps everything back to the main new wallet. Use `--drain-limit N` to limit scanning to the first N pool accounts.
 
 ## Configuration Options
 
@@ -122,12 +145,11 @@ Sweeps all UTXOs to a single output per wallet, polls for mining confirmation, a
 | `--new-wallet-account` | `default` | Account name in minotari-cli wallet |
 | `--new-wallet-password` | `""` (env: `TARI_WALLET_PASSWORD`) | Password for minotari-cli account |
 | `--new-wallet-seed-words` | — (env: `TARI_SEED_WORDS`) | Space-separated 24-word mnemonic |
-| `--base-node-url` | `https://rpc.tari.com` | Base node HTTP RPC for broadcasting (new wallet) |
+| `--base-node-url` | network-dependent (e.g. `https://rpc.esmeralda.tari.com`) | Base node HTTP RPC for broadcasting (new wallet) |
 | `--network` | `esmeralda` | Network (mainnet, nextnet, esmeralda, localnet) |
 | `--block-time-secs` | `120` | Block time for confirmation calculations |
 | `--confirmations` | `3` | Confirmations to wait between phases |
 | `--address-pool-size` | `1000` | Number of receive-only sink addresses to generate |
-| `--new-wallet-seed-words` | auto from `data/setup.json` | Seed words (auto-loaded after `setup`) |
 | `--address-pool-file` | `data/address_pool.json` | Path to address pool JSON (loaded if exists, generated otherwise) |
 | `--output-dir` | `results` | Directory for CSV output files |
 | `--log-level` | `info` | Log verbosity (error/warn/info/debug/trace) |
@@ -186,6 +208,7 @@ src/
 │   ├── fragmentation.rs # UTXO cascade split + aggregation sends
 │   └── lock_contention.rs # Rapid sequential sends measuring UTXO lock contention
 ├── load/
+│   ├── mod.rs
 │   └── patterns.rs      # LoadPattern: Constant, Ramp, Burst, Poisson
 ├── metrics/
 │   ├── recorder.rs      # TransactionRecord, SystemSnapshot, MetricsCollector, ScenarioStats
@@ -194,5 +217,6 @@ src/
 └── fund_management/
     ├── splitter.rs       # Cascading UTXO splits with metric recording
     ├── consolidator.rs   # Sweep to single UTXO with tx status polling
+    ├── drainer.rs        # Drain address pool sink wallets back to main wallet
     └── reconciler.rs     # Inter-scenario balance verification
 ```
