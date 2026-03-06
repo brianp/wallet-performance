@@ -1,0 +1,61 @@
+[package]
+name = "wallet-performance"
+version = "0.1.0"
+edition = "2021"
+description = "Performance test harness comparing minotari_console_wallet (gRPC) vs minotari-cli (REST)"
+
+[dependencies]
+# Tari gRPC client for old wallet
+minotari_wallet_grpc_client = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+
+# New wallet (minotari-cli) — direct library usage
+minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "8dc74a48f025345a0451a69275d221b8d617077a" }
+
+# Lightweight wallet scanning library — used for bulk multi-key scanning in drain
+lightweight_wallet_libs = { git = "https://github.com/tari-project/tari-wallet", rev = "a43164233665486d604f51996db6f892dc7a6e2e", features = ["http"] }
+
+# Tari core types
+tari_common_types = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+tari_common = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+tari_crypto = { version = "0.22.1" }
+tari_transaction_components = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+
+# SQLite for new wallet DB access
+r2d2 = "0.8"
+r2d2_sqlite = "0.31"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# gRPC
+tonic = { version = "0.13", features = ["transport"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Metrics / timing
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+
+# Async trait
+async-trait = "0.1"
+
+# Random for load patterns
+rand = "0.8"
+
+# System monitoring
+sysinfo = "0.33"
+
+# UUID for idempotency keys
+uuid = { version = "1", features = ["v4"] }
