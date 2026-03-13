@@ -9,10 +9,10 @@ description = "Performance test harness comparing minotari_console_wallet (gRPC)
 minotari_wallet_grpc_client = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
 
 # New wallet (minotari-cli) — direct library usage
-minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "5611dd5" }
+minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "cbe4719" }
 
 # Lightweight wallet scanning library — used for bulk multi-key scanning in drain
-lightweight_wallet_libs = { git = "https://github.com/tari-project/tari-wallet", rev = "a43164233665486d604f51996db6f892dc7a6e2e", features = ["http"] }
+lightweight_wallet_libs = { git = "https://github.com/tari-project/tari-wallet", rev = "55e98ce85b2a425bafbdac2ad4d63d7b35ce98e0", features = ["http"] }
 
 # Tari core types
 tari_common_types = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }

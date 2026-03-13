@@ -2375,6 +2375,38 @@ dependencies = [
 [[package]]
 name = "lightweight_wallet_libs"
 version = "0.2.0"
+source = "git+https://github.com/tari-project/tari-wallet?rev=55e98ce85b2a425bafbdac2ad4d63d7b35ce98e0#55e98ce85b2a425bafbdac2ad4d63d7b35ce98e0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "getrandom 0.2.17",
+ "js-sys",
+ "num_cpus",
+ "primitive-types",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "tari_common",
+ "tari_common_types",
+ "tari_crypto",
+ "tari_node_components",
+ "tari_script",
+ "tari_transaction_components",
+ "tari_utilities",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "lightweight_wallet_libs"
+version = "0.2.0"
 source = "git+https://github.com/tari-project/tari-wallet?rev=a43164233665486d604f51996db6f892dc7a6e2e#a43164233665486d604f51996db6f892dc7a6e2e"
 dependencies = [
  "anyhow",
@@ -2581,7 +2613,7 @@ dependencies = [
 [[package]]
 name = "minotari"
 version = "0.1.0"
-source = "git+https://github.com/tari-project/minotari-cli.git?rev=5611dd5#5611dd5d5696e9e3df9d310cccf7e58334f7334a"
+source = "git+https://github.com/tari-project/minotari-cli.git?rev=cbe4719#cbe4719a2b58416c8381dc032094124ca67181c3"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -2593,7 +2625,7 @@ dependencies = [
  "hex",
  "hmac",
  "include_dir",
- "lightweight_wallet_libs",
+ "lightweight_wallet_libs 0.2.0 (git+https://github.com/tari-project/tari-wallet?rev=a43164233665486d604f51996db6f892dc7a6e2e)",
  "log",
  "log4rs",
  "r2d2",
@@ -5892,7 +5924,7 @@ dependencies = [
  "clap 4.5.60",
  "csv",
  "env_logger",
- "lightweight_wallet_libs",
+ "lightweight_wallet_libs 0.2.0 (git+https://github.com/tari-project/tari-wallet?rev=55e98ce85b2a425bafbdac2ad4d63d7b35ce98e0)",
  "log",
  "minotari",
  "minotari_wallet_grpc_client",
