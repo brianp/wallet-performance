@@ -37,8 +37,6 @@ pub struct NewWalletDriver {
     seed_words: Vec<String>,
     base_node_url: String,
     confirmation_window: u64,
-    /// Tracks whether we've done the initial full sync.
-    initial_sync_done: std::sync::atomic::AtomicBool,
 }
 
 impl NewWalletDriver {
@@ -68,7 +66,6 @@ impl NewWalletDriver {
             seed_words,
             base_node_url,
             confirmation_window,
-            initial_sync_done: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -150,24 +147,9 @@ impl NewWalletDriver {
         Ok(more_blocks)
     }
 
-    /// Full sync from birthday to chain tip. Only needed once.
-    pub async fn sync(&self) -> anyhow::Result<()> {
-        self.run_scan(ScanMode::Full).await?;
-        self.initial_sync_done
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Catch up with any new blocks since last scan.
+    /// The scanner resumes from where it left off (stored in DB).
     pub async fn sync_to_tip(&self) -> anyhow::Result<()> {
-        if !self
-            .initial_sync_done
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return self.sync().await;
-        }
-        // After initial sync, a partial scan with a generous limit catches up quickly.
-        // The scanner resumes from where it left off (stored in DB).
         let mut more = true;
         while more {
             more = self

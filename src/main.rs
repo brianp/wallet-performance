@@ -300,7 +300,8 @@ async fn ensure_utxos(
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("FundsPending") || msg.contains("funds") {
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("fundspending") || msg_lower.contains("funds") || msg_lower.contains("pending") {
                     if split_start.elapsed() > max_wait {
                         return Err(e.context("Timed out waiting for funds to settle before split"));
                     }
@@ -444,7 +445,7 @@ async fn run_baseline(
     collector: &MetricsCollector,
 ) -> anyhow::Result<(u64, u64)> {
     info!("=== Syncing new wallet before baseline ===");
-    new.sync().await?;
+    new.sync_to_tip().await?;
     info!("=== Phase 3: Baseline Measurements ===");
 
     // Check connectivity and initial balances
@@ -676,7 +677,7 @@ async fn run_setup(setup_config: &config::SetupConfig) -> anyhow::Result<()> {
 
     // Initial sync — catches up from wallet birthday to chain tip
     println!("  Syncing new wallet with blockchain...");
-    if let Err(e) = new_wallet.sync().await {
+    if let Err(e) = new_wallet.sync_to_tip().await {
         warn!("Initial sync failed: {}", e);
     }
 
@@ -868,7 +869,7 @@ async fn main() -> anyhow::Result<()> {
             );
 
             info!("=== Syncing new wallet ===");
-            new.sync().await?;
+            new.sync_to_tip().await?;
             let initial_balance = new.get_balance().await?.available;
 
             run_all_scenarios_for_wallet(
