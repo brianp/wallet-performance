@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use log::warn;
 use tari_common::configuration::Network;
 use tari_common_types::payment_reference::generate_payment_reference;
@@ -14,16 +15,17 @@ use tari_transaction_components::offline_signing::sign_locked_transaction;
 use tari_transaction_components::MicroMinotari;
 
 use crate::address_pool::AddressPoolEntry;
-use lightweight_wallet_libs::scanning::BlockchainScanner;
-use lightweight_wallet_libs::{HttpBlockchainScanner, ScanConfig};
+use minotari_scanning::scanning::BlockchainScanner;
+use minotari_scanning::{HttpBlockchainScanner, ScanConfig};
 use minotari::db::{self, SqlitePool};
 use minotari::http::WalletHttpClient;
+use minotari::models::BalanceChange;
 use minotari::scan::{ScanMode, Scanner};
 use minotari::transactions::manager::TransactionSender;
 use minotari::transactions::one_sided_transaction::Recipient;
 
 const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60;
-const SCAN_BATCH_SIZE: u64 = 100;
+const SCAN_BATCH_SIZE: u64 = 25;
 const BIRTHDAY_GENESIS_FROM_UNIX_EPOCH: u64 = 1640995200;
 
 /// Drains funds from address pool sink accounts back to a destination wallet.
@@ -104,19 +106,10 @@ impl Drainer {
             warn!("[drain] Default account scan failed: {}", e);
         }
 
-        // Get birthday from main account for start height calculation
-        let main_accounts = db::get_accounts(&conn, Some("default"))?;
-        let birthday = main_accounts
-            .first()
-            .map(|a| a.birthday as u64)
-            .unwrap_or(0);
-
-        // Calculate start height from birthday (same logic as Scanner)
         let wallet_client = WalletHttpClient::new(base_node_url.parse()?)?;
-        let scanning_offset: u64 = 2;
-        let timestamp =
-            birthday.saturating_sub(scanning_offset) * 24 * 60 * 60 + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
-        let start_height = wallet_client.get_height_at_time(timestamp).await?;
+
+        // Start scanning from height 500000 — all pool wallets were created after this
+        let start_height: u64 = 522_000;
 
         let tip = wallet_client.get_tip_info().await?;
         let tip_height = tip
@@ -191,7 +184,7 @@ impl Drainer {
             }
 
             let last_height = blocks.last().map(|b| b.height).unwrap_or(0);
-            let last_hash = blocks.last().map(|b| b.block_hash).unwrap_or_default();
+            let _last_hash = blocks.last().map(|b| b.block_hash).unwrap_or_default();
             println!(
                 "  [drain] Processing {} blocks (heights {}-{})...",
                 blocks.len(),
@@ -227,7 +220,46 @@ impl Drainer {
                         None,
                         payment_reference,
                     ) {
-                        Ok(_) => {
+                        Ok(output_id) => {
+                            // Immediately confirm — these outputs are long confirmed on chain
+                            let _ = db::mark_output_confirmed(
+                                &conn,
+                                output_hash,
+                                block.height,
+                                block.block_hash.as_slice(),
+                            );
+
+                            // Create balance_change record so get_balance() sees the credit
+                            let effective_date = DateTime::<Utc>::from_timestamp(
+                                block.mined_timestamp as i64, 0
+                            ).unwrap_or_else(Utc::now).naive_utc();
+
+                            let balance_change = BalanceChange {
+                                account_id: account.id,
+                                caused_by_output_id: Some(output_id),
+                                caused_by_input_id: None,
+                                description: "Output found in drain scan".to_string(),
+                                balance_credit: wallet_output.value(),
+                                balance_debit: 0.into(),
+                                effective_date,
+                                effective_height: block.height,
+                                claimed_recipient_address: None,
+                                claimed_sender_address: None,
+                                memo_parsed: None,
+                                memo_hex: None,
+                                claimed_fee: None,
+                                claimed_amount: None,
+                                is_reversal: false,
+                                reversal_of_balance_change_id: None,
+                                is_reversed: false,
+                            };
+                            if let Err(e) = db::insert_balance_change(&conn, &balance_change) {
+                                warn!(
+                                    "[drain] Failed to insert balance_change for pool_{}: {}",
+                                    entry.index, e
+                                );
+                            }
+
                             total_outputs += 1;
                             println!(
                                 "  [drain] Found output for pool_{}: {} µT at height {}",
@@ -248,52 +280,10 @@ impl Drainer {
                 }
             }
 
-            // Record scanned tip + confirm outputs for all pool accounts
-            println!(
-                "  [drain] Updating DB for {} pool accounts...",
-                entries.len()
-            );
-            let mut confirmed_count = 0usize;
-            for (i, entry) in entries.iter().enumerate() {
-                let account_name = format!("pool_{}", entry.index);
-                if let Ok(accounts) = db::get_accounts(&conn, Some(&account_name)) {
-                    if let Some(account) = accounts.first() {
-                        let _ = db::insert_scanned_tip_block(
-                            &conn,
-                            account.id,
-                            last_height as i64,
-                            last_hash.as_slice(),
-                        );
-
-                        // Confirm outputs with enough confirmations
-                        let unconfirmed =
-                            db::get_unconfirmed_outputs(&conn, account.id, last_height, confirmations);
-                        if let Ok(rows) = unconfirmed {
-                            for row in rows {
-                                let _ = db::mark_output_confirmed(
-                                    &conn,
-                                    &row.output_hash,
-                                    last_height,
-                                    last_hash.as_slice(),
-                                );
-                                confirmed_count += 1;
-                            }
-                        }
-                    }
-                }
-                if (i + 1) % 250 == 0 {
-                    println!(
-                        "  [drain]   ...{}/{} accounts updated",
-                        i + 1,
-                        entries.len()
-                    );
-                }
-            }
-
             let elapsed = scan_start.elapsed().as_secs();
             println!(
-                "  [drain] Scanned to height {}/{}, {} outputs found, {} confirmed ({}s elapsed)",
-                last_height, tip_height, total_outputs, confirmed_count, elapsed
+                "  [drain] Scanned to height {}/{}, {} outputs found ({}s elapsed)",
+                last_height, tip_height, total_outputs, elapsed
             );
 
             if !more_blocks {
@@ -301,6 +291,34 @@ impl Drainer {
             }
 
             current_config = current_config.with_start_height(last_height + 1);
+        }
+
+        // Record scanned tip for all pool accounts so UTXO selector can find outputs
+        let final_tip = wallet_client.get_tip_info().await?;
+        let final_tip_height = final_tip
+            .metadata
+            .as_ref()
+            .map(|m| m.best_block_height())
+            .unwrap_or(tip_height);
+        let final_tip_hash = final_tip
+            .metadata
+            .as_ref()
+            .map(|m| m.best_block_hash().clone())
+            .unwrap_or_default();
+
+        println!("  [drain] Recording scanned tip at height {} for all pool accounts...", final_tip_height);
+        for entry in entries.iter() {
+            let account_name = format!("pool_{}", entry.index);
+            if let Ok(accounts) = db::get_accounts(&conn, Some(&account_name)) {
+                if let Some(account) = accounts.first() {
+                    let _ = db::insert_scanned_tip_block(
+                        &conn,
+                        account.id,
+                        final_tip_height as i64,
+                        final_tip_hash.as_slice(),
+                    );
+                }
+            }
         }
 
         let total_elapsed = scan_start.elapsed().as_secs();

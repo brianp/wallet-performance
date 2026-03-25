@@ -949,6 +949,20 @@ async fn main() -> anyhow::Result<()> {
             info!("Consolidation complete");
         }
 
+        Command::Sync { wallet_config } => {
+            let (_old, new) = create_drivers(&wallet_config)?;
+            info!("=== Syncing new wallet ===");
+            new.sync_to_tip().await?;
+            let balance = new.get_balance().await?;
+            println!("\n========================================");
+            println!("  WALLET BALANCE");
+            println!("========================================");
+            println!("  Available:    {} µT ({} tXTM)", balance.available, balance.available / 1_000_000);
+            println!("  Pending in:   {} µT", balance.pending_incoming);
+            println!("  Locked:       {} µT", balance.locked);
+            println!("========================================\n");
+        }
+
         Command::Drain {
             wallet_config,
             drain_limit,

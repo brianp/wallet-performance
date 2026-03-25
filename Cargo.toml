@@ -6,19 +6,19 @@ description = "Performance test harness comparing minotari_console_wallet (gRPC)
 
 [dependencies]
 # Tari gRPC client for old wallet
-minotari_wallet_grpc_client = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+minotari_wallet_grpc_client = "5.3.0-pre.3"
 
 # New wallet (minotari-cli) — direct library usage
-minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "cbe4719" }
+minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "4dc6c0d" }
 
-# Lightweight wallet scanning library — used for bulk multi-key scanning in drain
-lightweight_wallet_libs = { git = "https://github.com/tari-project/tari-wallet", rev = "55e98ce85b2a425bafbdac2ad4d63d7b35ce98e0", features = ["http"] }
+# Scanning library — used for bulk multi-key scanning in drain (part of minotari-cli workspace)
+minotari-scanning = { git = "https://github.com/tari-project/minotari-cli.git", rev = "4dc6c0d", features = ["http"] }
 
 # Tari core types
-tari_common_types = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
-tari_common = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+tari_common_types = "5.3.0-pre.3"
+tari_common = "5.3.0-pre.3"
 tari_crypto = { version = "0.22.1" }
-tari_transaction_components = { git = "https://github.com/tari-project/tari.git", rev = "32df87fab620ae2ccd34d37aac9a7670351932d0" }
+tari_transaction_components = "5.3.0-pre.3"
 
 # SQLite for new wallet DB access
 r2d2 = "0.8"
@@ -26,6 +26,7 @@ r2d2_sqlite = "0.31"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # gRPC
 tonic = { version = "0.13", features = ["transport"] }

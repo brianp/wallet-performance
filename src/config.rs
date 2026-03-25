@@ -70,6 +70,11 @@ pub enum Command {
         #[command(flatten)]
         wallet_config: WalletConfig,
     },
+    /// Sync the new wallet to chain tip and print balance
+    Sync {
+        #[command(flatten)]
+        wallet_config: WalletConfig,
+    },
     /// Drain funds from address pool sink wallets back to the new wallet
     Drain {
         #[command(flatten)]

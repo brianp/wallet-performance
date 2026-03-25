@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use log::{debug, info, warn};
 use minotari::db::{self, SqlitePool};
 use minotari::scan::{ProcessingEvent, ScanMode, ScanStatusEvent, Scanner};
+use minotari::tasks::unlocker::TransactionUnlocker;
 use minotari::transactions::manager::TransactionSender;
 use minotari::transactions::one_sided_transaction::Recipient;
 use tari_common::configuration::Network;
@@ -19,14 +22,30 @@ use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, Wa
 use tari_transaction_components::key_manager::KeyManager;
 use tari_transaction_components::offline_signing::sign_locked_transaction;
 use tari_transaction_components::MicroMinotari;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{SendResult, TransactionStatus, UtxoInfo, WalletBalance, WalletDriver};
 
-const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60; // 1 hour
-const SCAN_BATCH_SIZE: u64 = 100;
-const SCAN_PROGRESS_LOG_INTERVAL: u64 = 1000; // Log every 1000 blocks
+const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60 * 2; // 2 hours, matching Universe
+const SCAN_PROGRESS_LOG_INTERVAL: u64 = 1000;
+
+/// Shared state between the background scanner and the driver.
+struct ScannerState {
+    at_tip: AtomicBool,
+    tip_reached: Notify,
+    last_scanned_height: AtomicU64,
+    transactions: Mutex<HashMap<String, TrackedTransaction>>,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedTransaction {
+    status: String,
+    mined_height: u64,
+    confirmations: u64,
+}
 
 pub struct NewWalletDriver {
     db_path: PathBuf,
@@ -37,6 +56,10 @@ pub struct NewWalletDriver {
     seed_words: Vec<String>,
     base_node_url: String,
     confirmation_window: u64,
+    scanner_state: Arc<ScannerState>,
+    cancel_token: CancellationToken,
+    _unlocker_shutdown: tokio::sync::broadcast::Sender<()>,
+    _scanner_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NewWalletDriver {
@@ -57,6 +80,107 @@ impl NewWalletDriver {
             base_node_url, network
         );
 
+        // Start the TransactionUnlocker background task, same as the daemon does.
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let unlocker = TransactionUnlocker::new(db_pool.clone());
+        tokio::spawn(unlocker.run(shutdown_tx.subscribe()));
+
+        // Unlock outputs stuck from completed transactions (the library's unlocker
+        // only handles expired PENDING transactions, not COMPLETED ones where the
+        // scanner crashed before marking outputs as spent).
+        Self::unlock_completed_transaction_outputs(&db_pool)?;
+
+        let scanner_state = Arc::new(ScannerState {
+            at_tip: AtomicBool::new(false),
+            tip_reached: Notify::new(),
+            last_scanned_height: AtomicU64::new(0),
+            transactions: Mutex::new(HashMap::new()),
+        });
+
+        let cancel_token = CancellationToken::new();
+
+        // Start continuous scanner on a dedicated thread (scan future is !Send
+        // because HttpBlockchainScanner is !Send).
+        let scanner_thread = {
+            let password = password.clone();
+            let base_node_url = base_node_url.clone();
+            let db_path = db_path.clone();
+            let account_name = account_name.clone();
+            let cancel_token = cancel_token.clone();
+            let state = scanner_state.clone();
+
+            std::thread::Builder::new()
+                .name("wallet-scanner".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .worker_threads(2)
+                        .build()
+                        .expect("Failed to create scanner runtime");
+
+                    rt.block_on(async move {
+                        loop {
+                            if cancel_token.is_cancelled() {
+                                break;
+                            }
+
+                            let scanner = Scanner::new(
+                                &password,
+                                &base_node_url,
+                                db_path.clone(),
+                                25,
+                                confirmation_window,
+                            )
+                            .account(&account_name)
+                            .max_error_retries(5)
+                            .mode(ScanMode::Continuous {
+                                poll_interval: Duration::from_secs(10),
+                            })
+                            .cancel_token(cancel_token.clone());
+
+                            let (event_rx, scan_future) = scanner.run_with_events();
+
+                            let state_clone = state.clone();
+                            let scan_handle = tokio::task::spawn_blocking(move || {
+                                tokio::runtime::Handle::current().block_on(scan_future)
+                            });
+
+                            let event_handle = tokio::spawn(
+                                process_events(event_rx, state_clone)
+                            );
+
+                            let scan_result = scan_handle.await;
+                            let _ = event_handle.await;
+
+                            match scan_result {
+                                Ok(Err(e)) => {
+                                    let msg = e.to_string();
+                                    if cancel_token.is_cancelled() {
+                                        break;
+                                    }
+                                    warn!("[scanner] Scanner crashed: {}. Restarting in 5s...", msg);
+                                    state.at_tip.store(false, Ordering::Release);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
+                                Ok(Ok(_)) => {
+                                    if cancel_token.is_cancelled() {
+                                        break;
+                                    }
+                                    info!("[scanner] Scanner exited cleanly. Restarting in 5s...");
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
+                                Err(e) => {
+                                    warn!("[scanner] Scanner task panicked: {}. Restarting in 5s...", e);
+                                    state.at_tip.store(false, Ordering::Release);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
+                            }
+                        }
+                    });
+                })
+                .context("Failed to spawn scanner thread")?
+        };
+
         Ok(Self {
             db_path,
             db_pool,
@@ -66,97 +190,78 @@ impl NewWalletDriver {
             seed_words,
             base_node_url,
             confirmation_window,
+            scanner_state,
+            cancel_token,
+            _unlocker_shutdown: shutdown_tx,
+            _scanner_thread: Some(scanner_thread),
         })
     }
 
-    /// Run a blockchain scan with progress logging.
-    async fn run_scan(&self, mode: ScanMode) -> anyhow::Result<bool> {
-        let label = match &mode {
-            ScanMode::Full => "full".to_string(),
-            ScanMode::Partial { max_blocks } => format!("partial({})", max_blocks),
-            ScanMode::Continuous { .. } => "continuous".to_string(),
-        };
+    /// Unlock outputs that are LOCKED by completed pending transactions.
+    /// This handles the case where the scanner crashed after a transaction was
+    /// broadcast but before it could mark the spent outputs.
+    fn unlock_completed_transaction_outputs(db_pool: &SqlitePool) -> anyhow::Result<()> {
+        let conn = db_pool.get()?;
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM outputs o
+            JOIN pending_transactions pt ON o.locked_by_request_id = pt.id
+            WHERE o.status = 'LOCKED'
+              AND o.deleted_at IS NULL
+              AND pt.status = 'COMPLETED'
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
 
-        let scanner = Scanner::new(
-            &self.password,
-            &self.base_node_url,
-            self.db_path.clone(),
-            SCAN_BATCH_SIZE,
-            self.confirmation_window,
-        )
-        .account(&self.account_name)
-        .mode(mode);
-
-        let (mut event_rx, scan_future) = scanner.run_with_events();
-
-        // Log progress at reasonable intervals, not every batch
-        let last_logged_height = AtomicU64::new(0);
-        let log_handle = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    ProcessingEvent::ScanStatus(ScanStatusEvent::Started {
-                        from_height, ..
-                    }) => {
-                        println!("  [scan] Starting from height {}", from_height);
-                        last_logged_height.store(from_height, Ordering::Relaxed);
-                    }
-                    ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
-                        current_height,
-                        blocks_scanned,
-                        ..
-                    }) => {
-                        let last = last_logged_height.load(Ordering::Relaxed);
-                        if current_height - last >= SCAN_PROGRESS_LOG_INTERVAL {
-                            println!(
-                                "  [scan] height={}, scanned={}",
-                                current_height, blocks_scanned
-                            );
-                            last_logged_height.store(current_height, Ordering::Relaxed);
-                        }
-                    }
-                    ProcessingEvent::ScanStatus(ScanStatusEvent::Completed {
-                        final_height,
-                        total_blocks_scanned,
-                        ..
-                    }) => {
-                        println!(
-                            "  [scan] Complete: tip={}, blocks={}",
-                            final_height, total_blocks_scanned
-                        );
-                    }
-                    ProcessingEvent::ScanStatus(ScanStatusEvent::Paused {
-                        last_scanned_height,
-                        ..
-                    }) => {
-                        debug!("[new_wallet] Scan paused at height {}", last_scanned_height);
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        let (events, more_blocks) = scan_future
-            .await
-            .map_err(|e| anyhow!("Scan ({}) failed: {}", label, e))?;
-
-        let _ = log_handle.await;
-
-        if !events.is_empty() {
-            info!("[new_wallet] Scan found {} wallet events", events.len());
+        if count > 0 {
+            conn.execute(
+                r#"
+                UPDATE outputs
+                SET status = 'UNSPENT', locked_by_request_id = NULL
+                WHERE status = 'LOCKED'
+                  AND deleted_at IS NULL
+                  AND locked_by_request_id IN (
+                    SELECT id FROM pending_transactions WHERE status = 'COMPLETED'
+                  )
+                "#,
+                [],
+            )?;
+            info!(
+                "[new_wallet] Unlocked {} outputs from completed transactions",
+                count
+            );
         }
-        Ok(more_blocks)
+
+        Ok(())
     }
 
-    /// Catch up with any new blocks since last scan.
-    /// The scanner resumes from where it left off (stored in DB).
+    /// Wait for the background continuous scanner to reach the chain tip.
     pub async fn sync_to_tip(&self) -> anyhow::Result<()> {
-        let mut more = true;
-        while more {
-            more = self
-                .run_scan(ScanMode::Partial { max_blocks: 5000 })
-                .await?;
+        if self.scanner_state.at_tip.load(Ordering::Acquire) {
+            return Ok(());
         }
-        Ok(())
+
+        let timeout = Duration::from_secs(600);
+        let start = std::time::Instant::now();
+
+        loop {
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .ok_or_else(|| anyhow!("Timed out waiting for scanner to reach tip"))?;
+
+            tokio::select! {
+                _ = self.scanner_state.tip_reached.notified() => {
+                    if self.scanner_state.at_tip.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    return Err(anyhow!("Timed out waiting for scanner to reach tip"));
+                }
+            }
+        }
     }
 
     fn create_sender(&self) -> anyhow::Result<TransactionSender> {
@@ -183,6 +288,118 @@ impl NewWalletDriver {
         );
 
         KeyManager::new(wallet_type).map_err(|e| anyhow!("Failed to create key manager: {}", e))
+    }
+}
+
+impl Drop for NewWalletDriver {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
+/// Process scanner events, updating shared state.
+async fn process_events(
+    mut event_rx: mpsc::UnboundedReceiver<ProcessingEvent>,
+    state: Arc<ScannerState>,
+) {
+    let last_logged_height = AtomicU64::new(0);
+
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Started { from_height, .. }) => {
+                state.at_tip.store(false, Ordering::Release);
+                println!("  [scan] Starting from height {}", from_height);
+                last_logged_height.store(from_height, Ordering::Relaxed);
+            }
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                current_height,
+                blocks_scanned,
+                ..
+            }) => {
+                let last = last_logged_height.load(Ordering::Relaxed);
+                if current_height - last >= SCAN_PROGRESS_LOG_INTERVAL {
+                    println!(
+                        "  [scan] height={}, scanned={}",
+                        current_height, blocks_scanned
+                    );
+                    last_logged_height.store(current_height, Ordering::Relaxed);
+                }
+            }
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Completed {
+                final_height,
+                total_blocks_scanned,
+                ..
+            }) => {
+                state.at_tip.store(true, Ordering::Release);
+                state
+                    .last_scanned_height
+                    .store(final_height, Ordering::Release);
+                state.tip_reached.notify_waiters();
+                info!(
+                    "[scanner] At tip: height={}, scanned={}",
+                    final_height, total_blocks_scanned
+                );
+            }
+            ProcessingEvent::ScanStatus(ScanStatusEvent::MoreBlocksAvailable {
+                last_scanned_height,
+                ..
+            }) => {
+                state.at_tip.store(false, Ordering::Release);
+                state
+                    .last_scanned_height
+                    .store(last_scanned_height, Ordering::Release);
+            }
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Waiting { .. }) => {
+                // Scanner is idle, waiting for next poll — we're at tip
+                state.at_tip.store(true, Ordering::Release);
+                state.tip_reached.notify_waiters();
+            }
+            ProcessingEvent::ScanStatus(ScanStatusEvent::Paused {
+                last_scanned_height,
+                ..
+            }) => {
+                debug!("[scanner] Paused at height {}", last_scanned_height);
+            }
+            ProcessingEvent::TransactionsReady(event) => {
+                let mut txns = state.transactions.lock().unwrap();
+                for tx in &event.transactions {
+                    txns.insert(
+                        tx.id.to_string(),
+                        TrackedTransaction {
+                            status: format!("{:?}", tx.status),
+                            mined_height: tx.blockchain.block_height,
+                            confirmations: tx.blockchain.confirmations,
+                        },
+                    );
+                }
+                info!(
+                    "[scanner] {} transactions ready at height {:?}",
+                    event.transactions.len(),
+                    event.block_height
+                );
+            }
+            ProcessingEvent::TransactionsUpdated(event) => {
+                let mut txns = state.transactions.lock().unwrap();
+                for tx in &event.updated_transactions {
+                    txns.insert(
+                        tx.id.to_string(),
+                        TrackedTransaction {
+                            status: format!("{:?}", tx.status),
+                            mined_height: tx.blockchain.block_height,
+                            confirmations: tx.blockchain.confirmations,
+                        },
+                    );
+                }
+            }
+            ProcessingEvent::ReorgDetected(event) => {
+                state.at_tip.store(false, Ordering::Release);
+                warn!(
+                    "[scanner] Reorg detected: rolled back {} blocks from height {}",
+                    event.blocks_rolled_back, event.reorg_from_height
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -284,12 +501,22 @@ impl WalletDriver for NewWalletDriver {
     }
 
     async fn get_transaction_status(&self, tx_id: &str) -> anyhow::Result<TransactionStatus> {
-        Ok(TransactionStatus {
-            tx_id: tx_id.to_string(),
-            status: "unknown".to_string(),
-            mined_height: None,
-            confirmations: None,
-        })
+        let txns = self.scanner_state.transactions.lock().unwrap();
+        if let Some(tracked) = txns.get(tx_id) {
+            Ok(TransactionStatus {
+                tx_id: tx_id.to_string(),
+                status: tracked.status.clone(),
+                mined_height: Some(tracked.mined_height),
+                confirmations: Some(tracked.confirmations),
+            })
+        } else {
+            Ok(TransactionStatus {
+                tx_id: tx_id.to_string(),
+                status: "unknown".to_string(),
+                mined_height: None,
+                confirmations: None,
+            })
+        }
     }
 
     async fn split_coins(&self, amount_per_split: u64, count: u64) -> anyhow::Result<SendResult> {
@@ -301,10 +528,44 @@ impl WalletDriver for NewWalletDriver {
             fee: None,
         };
 
-        for _ in 0..count {
+        for i in 0..count {
             last_result = self.send_transaction(&address, amount_per_split).await?;
             if !last_result.accepted {
                 return Ok(last_result);
+            }
+
+            if i + 1 < count {
+                info!(
+                    "[new_wallet] Split {}/{}: waiting for change UTXO to confirm...",
+                    i + 1,
+                    count
+                );
+                self.sync_to_tip().await?;
+
+                let needed = amount_per_split + 10_000;
+                let poll_interval = Duration::from_secs(30);
+                let max_wait = Duration::from_secs(900);
+                let start = std::time::Instant::now();
+
+                loop {
+                    let balance = self.get_balance().await?;
+                    if balance.available >= needed {
+                        break;
+                    }
+                    if start.elapsed() > max_wait {
+                        warn!(
+                            "[new_wallet] Timed out waiting for change UTXO. Available: {}, need: {}",
+                            balance.available, needed
+                        );
+                        break;
+                    }
+                    debug!(
+                        "[new_wallet] Available {} < needed {}, waiting...",
+                        balance.available, needed
+                    );
+                    sleep(poll_interval).await;
+                    self.sync_to_tip().await?;
+                }
             }
         }
 
@@ -340,7 +601,16 @@ impl WalletDriver for NewWalletDriver {
     }
 
     async fn get_completed_transactions(&self) -> anyhow::Result<Vec<TransactionStatus>> {
-        Ok(Vec::new())
+        let txns = self.scanner_state.transactions.lock().unwrap();
+        Ok(txns
+            .iter()
+            .map(|(id, t)| TransactionStatus {
+                tx_id: id.clone(),
+                status: t.status.clone(),
+                mined_height: Some(t.mined_height),
+                confirmations: Some(t.confirmations),
+            })
+            .collect())
     }
 
     async fn sync_blockchain(&self) -> anyhow::Result<()> {
@@ -353,10 +623,8 @@ impl WalletDriver for NewWalletDriver {
         let poll_interval = Duration::from_secs(30);
         let stable_threshold = Duration::from_secs(60);
 
-        // Sync once at the start
-        if let Err(e) = self.sync_to_tip().await {
-            warn!("Scan during balance wait failed: {}", e);
-        }
+        // Wait for initial sync
+        self.sync_to_tip().await?;
 
         let mut last_balance = self.get_balance().await?;
         let mut last_change = std::time::Instant::now();
@@ -369,11 +637,8 @@ impl WalletDriver for NewWalletDriver {
 
             sleep(poll_interval).await;
 
-            // Quick catch-up scan — usually 0-1 new blocks in 30s
-            if let Err(e) = self.sync_to_tip().await {
-                warn!("Scan during balance wait failed: {}", e);
-            }
-
+            // The continuous scanner keeps the DB up to date in the background,
+            // so we just need to re-read the balance.
             let current = self.get_balance().await?;
 
             if current.available != last_balance.available
