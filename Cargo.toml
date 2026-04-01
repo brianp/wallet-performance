@@ -9,10 +9,10 @@ description = "Performance test harness comparing minotari_console_wallet (gRPC)
 minotari_wallet_grpc_client = "5.3.0-pre.3"
 
 # New wallet (minotari-cli) — direct library usage
-minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "4dc6c0d" }
+minotari = { git = "https://github.com/tari-project/minotari-cli.git", rev = "5402a13" }
 
 # Scanning library — used for bulk multi-key scanning in drain (part of minotari-cli workspace)
-minotari-scanning = { git = "https://github.com/tari-project/minotari-cli.git", rev = "4dc6c0d", features = ["http"] }
+minotari-scanning = { git = "https://github.com/tari-project/minotari-cli.git", rev = "5402a13", features = ["http"] }
 
 # Tari core types
 tari_common_types = "5.3.0-pre.3"
@@ -60,3 +60,7 @@ sysinfo = "0.33"
 
 # UUID for idempotency keys
 uuid = { version = "1", features = ["v4"] }
+
+# Process management (SIGTERM on Unix)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

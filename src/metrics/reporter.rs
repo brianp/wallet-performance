@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context;
 use log::info;
 
-use super::recorder::{MetricsCollector, SystemSnapshot, TransactionRecord};
+use super::recorder::{MetricsCollector, ScanRecord, SystemSnapshot, TransactionRecord};
 
 /// Generates CSV reports from collected metrics.
 pub struct Reporter;
@@ -23,6 +23,11 @@ impl Reporter {
         let snapshots = collector.get_snapshots();
         if !snapshots.is_empty() {
             Self::write_snapshots_csv(&snapshots, &output_dir.join("system_snapshots.csv"))?;
+        }
+
+        let scans = collector.get_scan_records();
+        if !scans.is_empty() {
+            Self::write_scans_csv(&scans, &output_dir.join("scans.csv"))?;
         }
 
         Self::write_summary(collector, &output_dir.join("summary.csv"))?;
@@ -44,6 +49,18 @@ impl Reporter {
             records.len(),
             path.display()
         );
+        Ok(())
+    }
+
+    fn write_scans_csv(records: &[ScanRecord], path: &Path) -> anyhow::Result<()> {
+        let mut writer =
+            csv::Writer::from_path(path).with_context(|| format!("Creating {}", path.display()))?;
+
+        for record in records {
+            writer.serialize(record)?;
+        }
+        writer.flush()?;
+        info!("Wrote {} scan records to {}", records.len(), path.display());
         Ok(())
     }
 
@@ -131,6 +148,21 @@ impl Reporter {
 
     /// Print a console summary comparing both wallets side-by-side.
     pub fn print_comparison(collector: &MetricsCollector) {
+        let scan_records = collector.get_scan_records();
+        if !scan_records.is_empty() {
+            println!("\n{}", "=".repeat(90));
+            println!("SCANNING PERFORMANCE");
+            println!("{}", "=".repeat(90));
+            for scan in &scan_records {
+                let duration_secs = scan.duration_ms as f64 / 1000.0;
+                println!(
+                    "  {}: {:.1}s (type={}, blocks={:?})",
+                    scan.wallet, duration_secs, scan.scan_type, scan.blocks_scanned,
+                );
+            }
+            println!();
+        }
+
         let all_txs = collector.get_transactions();
         let mut scenarios: Vec<String> = all_txs.iter().map(|t| t.scenario.clone()).collect();
         scenarios.sort();

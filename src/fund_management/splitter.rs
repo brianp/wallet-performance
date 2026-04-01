@@ -129,8 +129,11 @@ impl Splitter {
             let balance = wallet.get_balance().await?;
             info!(
                 "[{}] Balance after round {}: available={}, pending_in={}, pending_out={}",
-                wallet_name, round, balance.available,
-                balance.pending_incoming, balance.pending_outgoing
+                wallet_name,
+                round,
+                balance.available,
+                balance.pending_incoming,
+                balance.pending_outgoing
             );
         }
 

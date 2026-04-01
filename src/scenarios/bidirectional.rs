@@ -42,10 +42,7 @@ impl Scenario for BidirectionalScenario {
         println!("  (UTXOs pre-split by ensure_utxos)");
         println!("  Estimated total time: ~30 min\n");
 
-        println!(
-            "  [{}] Ramping send rate over 30 minutes...",
-            wallet.name()
-        );
+        println!("  [{}] Ramping send rate over 30 minutes...", wallet.name());
         let pattern = LoadPattern::Ramp {
             start_tps: 1.0 / 60.0,   // 1 tx/min
             max_tps: 5.0 / 60.0,     // 5 tx/min

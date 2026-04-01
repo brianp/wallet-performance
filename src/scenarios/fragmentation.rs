@@ -47,7 +47,10 @@ impl Scenario for FragmentationScenario {
         println!("  Estimated total time: ~10 min (mostly waiting for confirmations)\n");
 
         // Phase 1: Further split (ensure_utxos already gave us 100 UTXOs)
-        println!("  [{}] Phase 1/2: Splitting into 400 x 20 tXTM...", wallet.name());
+        println!(
+            "  [{}] Phase 1/2: Splitting into 400 x 20 tXTM...",
+            wallet.name()
+        );
         Splitter::split(
             wallet,
             20_000_000, // 20 tXTM
@@ -59,7 +62,10 @@ impl Scenario for FragmentationScenario {
         .await?;
 
         // Phase 2: Send progressively larger amounts requiring more input aggregation
-        println!("  [{}] Phase 2/2: Aggregation sends to self...", wallet.name());
+        println!(
+            "  [{}] Phase 2/2: Aggregation sends to self...",
+            wallet.name()
+        );
         let self_address = wallet.get_address().await?;
         let test_amounts = [
             (50_000_000u64, "50_tXTM"),   // ~3 inputs

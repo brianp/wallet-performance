@@ -15,19 +15,17 @@ use tari_transaction_components::offline_signing::sign_locked_transaction;
 use tari_transaction_components::MicroMinotari;
 
 use crate::address_pool::AddressPoolEntry;
-use minotari_scanning::scanning::BlockchainScanner;
-use minotari_scanning::{HttpBlockchainScanner, ScanConfig};
 use minotari::db::{self, SqlitePool};
 use minotari::http::WalletHttpClient;
 use minotari::models::BalanceChange;
 use minotari::scan::{ScanMode, Scanner};
 use minotari::transactions::manager::TransactionSender;
 use minotari::transactions::one_sided_transaction::Recipient;
+use minotari_scanning::scanning::BlockchainScanner;
+use minotari_scanning::{HttpBlockchainScanner, ScanConfig};
 
 const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60;
 const SCAN_BATCH_SIZE: u64 = 25;
-const BIRTHDAY_GENESIS_FROM_UNIX_EPOCH: u64 = 1640995200;
-
 /// Drains funds from address pool sink accounts back to a destination wallet.
 pub struct Drainer;
 
@@ -127,10 +125,7 @@ impl Drainer {
         );
 
         // Build key managers for all pool entries
-        println!(
-            "  [drain] Building {} key managers...",
-            entries.len()
-        );
+        println!("  [drain] Building {} key managers...", entries.len());
         let mut key_managers: Vec<KeyManager> = Vec::with_capacity(entries.len());
         for (i, entry) in entries.iter().enumerate() {
             let view_key = PrivateKey::from_hex(&entry.view_key_hex)
@@ -143,7 +138,11 @@ impl Drainer {
                 .map_err(|e| anyhow!("KeyManager failed for pool_{}: {}", entry.index, e))?;
             key_managers.push(km);
             if (i + 1) % 250 == 0 {
-                println!("  [drain]   ...{}/{} key managers built", i + 1, entries.len());
+                println!(
+                    "  [drain]   ...{}/{} key managers built",
+                    i + 1,
+                    entries.len()
+                );
             }
         }
         println!("  [drain] All {} key managers ready", key_managers.len());
@@ -169,10 +168,7 @@ impl Drainer {
         let scan_start = std::time::Instant::now();
         loop {
             batch_num += 1;
-            println!(
-                "  [drain] Fetching block batch {}...",
-                batch_num
-            );
+            println!("  [drain] Fetching block batch {}...", batch_num);
             let (blocks, more_blocks) = bulk_scanner
                 .scan_blocks(&current_config)
                 .await
@@ -219,6 +215,7 @@ impl Drainer {
                         None,
                         None,
                         payment_reference,
+                        false, // is_burn
                     ) {
                         Ok(output_id) => {
                             // Immediately confirm — these outputs are long confirmed on chain
@@ -230,9 +227,10 @@ impl Drainer {
                             );
 
                             // Create balance_change record so get_balance() sees the credit
-                            let effective_date = DateTime::<Utc>::from_timestamp(
-                                block.mined_timestamp as i64, 0
-                            ).unwrap_or_else(Utc::now).naive_utc();
+                            let effective_date =
+                                DateTime::<Utc>::from_timestamp(block.mined_timestamp as i64, 0)
+                                    .unwrap_or_else(Utc::now)
+                                    .naive_utc();
 
                             let balance_change = BalanceChange {
                                 account_id: account.id,
@@ -303,10 +301,13 @@ impl Drainer {
         let final_tip_hash = final_tip
             .metadata
             .as_ref()
-            .map(|m| m.best_block_hash().clone())
+            .map(|m| *m.best_block_hash())
             .unwrap_or_default();
 
-        println!("  [drain] Recording scanned tip at height {} for all pool accounts...", final_tip_height);
+        println!(
+            "  [drain] Recording scanned tip at height {} for all pool accounts...",
+            final_tip_height
+        );
         for entry in entries.iter() {
             let account_name = format!("pool_{}", entry.index);
             if let Ok(accounts) = db::get_accounts(&conn, Some(&account_name)) {
@@ -324,7 +325,9 @@ impl Drainer {
         let total_elapsed = scan_start.elapsed().as_secs();
         println!(
             "  [drain] Bulk scan complete in {}s: {} outputs found across {} pool accounts",
-            total_elapsed, total_outputs, entries.len()
+            total_elapsed,
+            total_outputs,
+            entries.len()
         );
         Ok(())
     }

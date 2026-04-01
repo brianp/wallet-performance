@@ -19,6 +19,19 @@ pub struct TransactionRecord {
     pub tx_type: String,
 }
 
+/// A blockchain scanning measurement record.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanRecord {
+    pub wallet: String,
+    pub scan_type: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub start_height: Option<u64>,
+    pub end_height: Option<u64>,
+    pub blocks_scanned: Option<u64>,
+}
+
 /// A periodic system snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemSnapshot {
@@ -34,6 +47,7 @@ pub struct SystemSnapshot {
 pub struct MetricsCollector {
     transactions: Mutex<Vec<TransactionRecord>>,
     snapshots: Mutex<Vec<SystemSnapshot>>,
+    scan_records: Mutex<Vec<ScanRecord>>,
     cumulative_fees: Mutex<u64>,
 }
 
@@ -42,6 +56,7 @@ impl MetricsCollector {
         Self {
             transactions: Mutex::new(Vec::new()),
             snapshots: Mutex::new(Vec::new()),
+            scan_records: Mutex::new(Vec::new()),
             cumulative_fees: Mutex::new(0),
         }
     }
@@ -57,6 +72,16 @@ impl MetricsCollector {
     /// Record a system snapshot.
     pub fn record_snapshot(&self, snapshot: SystemSnapshot) {
         self.snapshots.lock().unwrap().push(snapshot);
+    }
+
+    /// Record a blockchain scan measurement.
+    pub fn record_scan(&self, record: ScanRecord) {
+        self.scan_records.lock().unwrap().push(record);
+    }
+
+    /// Get all scan records.
+    pub fn get_scan_records(&self) -> Vec<ScanRecord> {
+        self.scan_records.lock().unwrap().clone()
     }
 
     /// Get total fees spent so far.

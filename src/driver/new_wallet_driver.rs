@@ -10,8 +10,9 @@ use log::{debug, info, warn};
 use minotari::db::{self, SqlitePool};
 use minotari::scan::{ProcessingEvent, ScanMode, ScanStatusEvent, Scanner};
 use minotari::tasks::unlocker::TransactionUnlocker;
+use minotari::transactions::fund_locker::FundLocker;
 use minotari::transactions::manager::TransactionSender;
-use minotari::transactions::one_sided_transaction::Recipient;
+use minotari::transactions::one_sided_transaction::{OneSidedTransaction, Recipient};
 use tari_common::configuration::Network;
 use tari_common_types::seeds::cipher_seed::CipherSeed;
 use tari_common_types::seeds::mnemonic::Mnemonic;
@@ -48,7 +49,6 @@ struct TrackedTransaction {
 }
 
 pub struct NewWalletDriver {
-    db_path: PathBuf,
     db_pool: SqlitePool,
     account_name: String,
     password: String,
@@ -158,6 +158,27 @@ impl NewWalletDriver {
                                     if cancel_token.is_cancelled() {
                                         break;
                                     }
+                                    // If UNIQUE constraint, the block was partially processed.
+                                    // Bump the scanned tip so we skip past it on restart.
+                                    if msg.contains("UNIQUE constraint") {
+                                        if let Ok(pool) = minotari::init_db(db_path.clone()) {
+                                            if let Ok(conn) = pool.get() {
+                                                let accounts = db::get_accounts(&conn, Some(&account_name));
+                                                if let Ok(accts) = accounts {
+                                                    if let Some(acct) = accts.first() {
+                                                        if let Ok(Some(tip)) = db::get_latest_scanned_tip_block_by_account(&conn, acct.id) {
+                                                            let next = tip.height + 1;
+                                                            // Insert a dummy tip block to skip past the problem
+                                                            let _ = db::insert_scanned_tip_block(
+                                                                &conn, acct.id, next as i64, &[0u8; 32],
+                                                            );
+                                                            warn!("[scanner] Bumped scanned tip from {} to {} to skip UNIQUE constraint block", tip.height, next);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     warn!("[scanner] Scanner crashed: {}. Restarting in 5s...", msg);
                                     state.at_tip.store(false, Ordering::Release);
                                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -182,7 +203,6 @@ impl NewWalletDriver {
         };
 
         Ok(Self {
-            db_path,
             db_pool,
             account_name,
             password,
@@ -243,23 +263,30 @@ impl NewWalletDriver {
             return Ok(());
         }
 
-        let timeout = Duration::from_secs(600);
+        let timeout = Duration::from_secs(1800); // 30 min for initial sync
+        let poll_interval = Duration::from_secs(10);
         let start = std::time::Instant::now();
 
         loop {
-            let remaining = timeout
-                .checked_sub(start.elapsed())
-                .ok_or_else(|| anyhow!("Timed out waiting for scanner to reach tip"))?;
+            if start.elapsed() > timeout {
+                let height = self
+                    .scanner_state
+                    .last_scanned_height
+                    .load(Ordering::Acquire);
+                return Err(anyhow!(
+                    "Timed out waiting for scanner to reach tip (last scanned height: {})",
+                    height
+                ));
+            }
 
+            // Poll with a short interval as fallback in case we miss a notification
             tokio::select! {
-                _ = self.scanner_state.tip_reached.notified() => {
-                    if self.scanner_state.at_tip.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                }
-                _ = tokio::time::sleep(remaining) => {
-                    return Err(anyhow!("Timed out waiting for scanner to reach tip"));
-                }
+                _ = self.scanner_state.tip_reached.notified() => {}
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+
+            if self.scanner_state.at_tip.load(Ordering::Acquire) {
+                return Ok(());
             }
         }
     }
@@ -484,6 +511,132 @@ impl WalletDriver for NewWalletDriver {
         }
     }
 
+    async fn send_batch_transaction(
+        &self,
+        recipients: &[(&str, u64)],
+    ) -> anyhow::Result<SendResult> {
+        if recipients.is_empty() {
+            return Ok(SendResult {
+                tx_id: String::new(),
+                accepted: false,
+                error: Some("No recipients".into()),
+                fee: None,
+            });
+        }
+
+        let parsed_recipients: Vec<Recipient> = recipients
+            .iter()
+            .map(|(addr, amount)| {
+                Ok(Recipient {
+                    address: TariAddress::from_base58(addr)
+                        .map_err(|e| anyhow!("Invalid address: {}", e))?,
+                    amount: MicroMinotari(*amount),
+                    payment_id: None,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let total_amount: MicroMinotari = parsed_recipients.iter().map(|r| r.amount).sum();
+        let num_outputs = parsed_recipients.len();
+        let fee_per_gram = MicroMinotari(5);
+        let idempotency_key = Uuid::new_v4().to_string();
+
+        // Step 1: Lock funds for the entire batch
+        let conn = self.db_pool.get()?;
+        let accounts = minotari::get_accounts(&conn, Some(&self.account_name))?;
+        let account = accounts
+            .first()
+            .ok_or_else(|| anyhow!("Account '{}' not found", self.account_name))?;
+
+        let fund_locker = FundLocker::new(self.db_pool.clone());
+        let locked_funds = match fund_locker.lock(
+            account.id,
+            total_amount,
+            num_outputs,
+            fee_per_gram,
+            None,
+            Some(idempotency_key),
+            SECONDS_TO_LOCK_UTXO,
+            self.confirmation_window,
+        ) {
+            Ok(funds) => funds,
+            Err(e) => {
+                return Ok(SendResult {
+                    tx_id: String::new(),
+                    accepted: false,
+                    error: Some(format!("Lock failed: {}", e)),
+                    fee: None,
+                });
+            }
+        };
+
+        // Step 2: Create unsigned transaction with all recipients
+        let one_sided_tx =
+            OneSidedTransaction::new(self.db_pool.clone(), self.network, self.password.clone());
+
+        let unsigned_tx = match one_sided_tx.create_unsigned_transaction(
+            account,
+            locked_funds,
+            parsed_recipients,
+            fee_per_gram,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return Ok(SendResult {
+                    tx_id: String::new(),
+                    accepted: false,
+                    error: Some(format!("Create unsigned tx failed: {}", e)),
+                    fee: None,
+                });
+            }
+        };
+
+        let fee = unsigned_tx.info.fee.0;
+
+        // Step 3: Sign
+        let key_manager = self.derive_key_manager()?;
+        let consensus_constants = ConsensusConstantsBuilder::new(self.network).build();
+
+        let signed_tx = match sign_locked_transaction(
+            &key_manager,
+            consensus_constants,
+            self.network,
+            unsigned_tx,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return Ok(SendResult {
+                    tx_id: String::new(),
+                    accepted: false,
+                    error: Some(format!("Sign failed: {}", e)),
+                    fee: Some(fee),
+                });
+            }
+        };
+
+        let tx_id = signed_tx.signed_transaction.tx_id.to_string();
+
+        // Step 4: Broadcast
+        let sender = self.create_sender()?;
+        match sender
+            .finalize_transaction_and_broadcast(signed_tx, self.base_node_url.clone())
+            .await
+        {
+            Ok(_) => Ok(SendResult {
+                tx_id,
+                accepted: true,
+                error: None,
+                fee: Some(fee),
+            }),
+            Err(e) => Ok(SendResult {
+                tx_id,
+                accepted: false,
+                error: Some(format!("Broadcast failed: {}", e)),
+                fee: Some(fee),
+            }),
+        }
+    }
+
     async fn get_balance(&self) -> anyhow::Result<WalletBalance> {
         let conn = self.db_pool.get()?;
         let accounts = minotari::get_accounts(&conn, Some(&self.account_name))?;
@@ -527,44 +680,61 @@ impl WalletDriver for NewWalletDriver {
             error: Some("No splits performed".to_string()),
             fee: None,
         };
+        let mut sent = 0u64;
 
-        for i in 0..count {
-            last_result = self.send_transaction(&address, amount_per_split).await?;
-            if !last_result.accepted {
-                return Ok(last_result);
-            }
-
-            if i + 1 < count {
+        while sent < count {
+            // Send as many as we can until funds run out
+            let result = self.send_transaction(&address, amount_per_split).await?;
+            if result.accepted {
+                sent += 1;
+                last_result = result;
+                if sent < count {
+                    // Try next one immediately — use available UTXOs while we can
+                    continue;
+                }
+            } else {
+                if sent == 0 {
+                    return Ok(result);
+                }
+                // Ran out of funds — wait for change outputs to confirm
                 info!(
-                    "[new_wallet] Split {}/{}: waiting for change UTXO to confirm...",
-                    i + 1,
-                    count
+                    "[new_wallet] Split {}/{}: waiting for funds to become available...",
+                    sent, count
                 );
-                self.sync_to_tip().await?;
-
-                let needed = amount_per_split + 10_000;
                 let poll_interval = Duration::from_secs(30);
                 let max_wait = Duration::from_secs(900);
                 let start = std::time::Instant::now();
+                let needed = amount_per_split + 10_000;
 
                 loop {
+                    sleep(poll_interval).await;
                     let balance = self.get_balance().await?;
                     if balance.available >= needed {
                         break;
                     }
                     if start.elapsed() > max_wait {
                         warn!(
-                            "[new_wallet] Timed out waiting for change UTXO. Available: {}, need: {}",
+                            "[new_wallet] Timed out waiting for funds. Available: {}, need: {}",
                             balance.available, needed
                         );
-                        break;
+                        return Ok(SendResult {
+                            tx_id: last_result.tx_id,
+                            accepted: true,
+                            error: Some(format!(
+                                "Only sent {}/{} splits before timeout",
+                                sent, count
+                            )),
+                            fee: last_result.fee,
+                        });
                     }
-                    debug!(
-                        "[new_wallet] Available {} < needed {}, waiting...",
-                        balance.available, needed
+                    info!(
+                        "[new_wallet] Split {}/{}: available={} µT, need={} µT, waiting... ({}s)",
+                        sent,
+                        count,
+                        balance.available,
+                        needed,
+                        start.elapsed().as_secs()
                     );
-                    sleep(poll_interval).await;
-                    self.sync_to_tip().await?;
                 }
             }
         }

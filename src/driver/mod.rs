@@ -1,5 +1,6 @@
 pub mod new_wallet_driver;
 pub mod old_wallet_driver;
+pub mod old_wallet_process;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -50,8 +51,30 @@ pub trait WalletDriver: Send + Sync {
     /// Human-readable name for this driver (e.g., "old_wallet", "new_wallet")
     fn name(&self) -> &str;
 
-    /// Send a transaction to a single recipient.
+    /// Send a transaction to a single recipient (user wallet pattern).
     async fn send_transaction(&self, recipient: &str, amount: u64) -> anyhow::Result<SendResult>;
+
+    /// Send a batch transaction to multiple recipients in one tx (payment processor pattern).
+    /// Each tuple is (address, amount_microtari).
+    async fn send_batch_transaction(
+        &self,
+        recipients: &[(&str, u64)],
+    ) -> anyhow::Result<SendResult> {
+        // Default: send individually (old wallet doesn't support batch natively)
+        let mut last = SendResult {
+            tx_id: String::new(),
+            accepted: false,
+            error: Some("No recipients".into()),
+            fee: None,
+        };
+        for (addr, amount) in recipients {
+            last = self.send_transaction(addr, *amount).await?;
+            if !last.accepted {
+                return Ok(last);
+            }
+        }
+        Ok(last)
+    }
 
     /// Get the current wallet balance.
     async fn get_balance(&self) -> anyhow::Result<WalletBalance>;

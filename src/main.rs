@@ -19,6 +19,7 @@ use address_pool::AddressPool;
 use config::{Cli, Command, ScenarioName, SetupState, WalletConfig};
 use driver::new_wallet_driver::NewWalletDriver;
 use driver::old_wallet_driver::OldWalletDriver;
+use driver::old_wallet_process::{OldWalletProcess, OldWalletProcessConfig};
 use driver::WalletDriver;
 use fund_management::{Consolidator, Drainer, Reconciler, Splitter};
 use metrics::reporter::Reporter;
@@ -31,7 +32,8 @@ use scenarios::lock_contention::LockContentionScenario;
 use scenarios::pool_payout::PoolPayoutScenario;
 use scenarios::Scenario;
 
-fn create_drivers(config: &WalletConfig) -> anyhow::Result<(OldWalletDriver, NewWalletDriver)> {
+/// Create a new wallet driver from existing DB (no fresh scan).
+fn create_new_driver(config: &WalletConfig) -> anyhow::Result<NewWalletDriver> {
     let network = Network::from_str(&config.network)
         .map_err(|e| anyhow::anyhow!("Invalid network '{}': {}", config.network, e))?;
 
@@ -50,8 +52,116 @@ fn create_drivers(config: &WalletConfig) -> anyhow::Result<(OldWalletDriver, New
         );
     }
 
-    let old = OldWalletDriver::new(config.old_wallet_grpc.clone(), config.fee_per_gram);
-    let new = NewWalletDriver::new(
+    NewWalletDriver::new(
+        config.new_wallet_db.clone(),
+        config.new_wallet_account.clone(),
+        config.new_wallet_password.clone(),
+        network,
+        seed_words,
+        config.resolved_base_node_url(),
+        config.confirmations,
+    )
+}
+
+/// Spawn a fresh old wallet process, measure its scan time, and return the process + driver.
+async fn measure_old_wallet_scan(
+    config: &WalletConfig,
+    collector: &MetricsCollector,
+) -> anyhow::Result<(OldWalletProcess, OldWalletDriver)> {
+    println!("\n========================================");
+    println!("  SCANNING: Old Wallet (fresh start)");
+    println!("========================================\n");
+
+    // Delete old wallet data for fresh scan
+    OldWalletProcess::clean_data_dir(&config.old_wallet_base_dir)?;
+
+    let seed_words = config.seed_words();
+    if seed_words.is_empty() {
+        anyhow::bail!("No seed words provided for old wallet scan measurement");
+    }
+
+    let process_config = OldWalletProcessConfig {
+        binary_path: config.old_wallet_binary.clone(),
+        base_dir: config.old_wallet_base_dir.clone(),
+        grpc_port: config.old_wallet_grpc_port,
+        network: config.network.clone(),
+        seed_words: seed_words.join(" "),
+        password: config.new_wallet_password.clone(),
+    };
+
+    let start_time = chrono::Utc::now();
+    let process = OldWalletProcess::spawn(&process_config).await?;
+    let scan_duration = process.wait_for_scan_complete().await?;
+    let end_time = chrono::Utc::now();
+
+    collector.record_scan(metrics::recorder::ScanRecord {
+        wallet: "old_wallet".to_string(),
+        scan_type: "full_scan".to_string(),
+        start_time,
+        end_time,
+        duration_ms: scan_duration.as_millis() as u64,
+        start_height: None,
+        end_height: None,
+        blocks_scanned: None,
+    });
+
+    println!(
+        "  Old wallet scan complete: {:.1}s\n",
+        scan_duration.as_secs_f64()
+    );
+
+    let driver = OldWalletDriver::new(process.grpc_addr.clone(), config.fee_per_gram);
+    Ok((process, driver))
+}
+
+/// Create a fresh new wallet DB, measure scan time, and return the driver.
+async fn measure_new_wallet_scan(
+    config: &WalletConfig,
+    collector: &MetricsCollector,
+) -> anyhow::Result<NewWalletDriver> {
+    let network = Network::from_str(&config.network)
+        .map_err(|e| anyhow::anyhow!("Invalid network '{}': {}", config.network, e))?;
+
+    let seed_words = config.seed_words();
+    if seed_words.is_empty() {
+        anyhow::bail!("No seed words provided for new wallet scan measurement");
+    }
+
+    println!("\n========================================");
+    println!("  SCANNING: New Wallet (fresh start)");
+    println!("========================================\n");
+
+    // Delete and recreate wallet DB for fresh scan
+    if config.new_wallet_db.exists() {
+        info!("Deleting existing new wallet DB for fresh scan");
+        std::fs::remove_file(&config.new_wallet_db)?;
+        // Also remove WAL/SHM files if they exist
+        let wal = config.new_wallet_db.with_extension("sqlite-wal");
+        let shm = config.new_wallet_db.with_extension("sqlite-shm");
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(&shm);
+    }
+
+    // Re-create wallet from seed
+    let seed_str = seed_words.join(" ");
+    let mnemonic = tari_common_types::seeds::seed_words::SeedWords::from_str(&seed_str)
+        .map_err(|e| anyhow::anyhow!("Invalid seed words: {}", e))?;
+    use tari_common_types::seeds::mnemonic::Mnemonic;
+    let cipher_seed = CipherSeed::from_mnemonic(&mnemonic, None)
+        .map_err(|e| anyhow::anyhow!("Failed to restore seed: {}", e))?;
+
+    minotari::utils::init_wallet::init_with_seed_words(
+        cipher_seed,
+        &config.new_wallet_password,
+        &config.new_wallet_db,
+        Some(&config.new_wallet_account),
+    )?;
+    info!("Re-created new wallet DB for fresh scan");
+
+    let start_time = chrono::Utc::now();
+    let timer = std::time::Instant::now();
+
+    let driver = NewWalletDriver::new(
         config.new_wallet_db.clone(),
         config.new_wallet_account.clone(),
         config.new_wallet_password.clone(),
@@ -60,12 +170,34 @@ fn create_drivers(config: &WalletConfig) -> anyhow::Result<(OldWalletDriver, New
         config.resolved_base_node_url(),
         config.confirmations,
     )?;
-    Ok((old, new))
+
+    // Measure sync to tip
+    driver.sync_to_tip().await?;
+    let scan_duration = timer.elapsed();
+    let end_time = chrono::Utc::now();
+
+    collector.record_scan(metrics::recorder::ScanRecord {
+        wallet: "new_wallet".to_string(),
+        scan_type: "full_scan".to_string(),
+        start_time,
+        end_time,
+        duration_ms: scan_duration.as_millis() as u64,
+        start_height: None,
+        end_height: None,
+        blocks_scanned: None,
+    });
+
+    println!(
+        "  New wallet scan complete: {:.1}s\n",
+        scan_duration.as_secs_f64()
+    );
+
+    Ok(driver)
 }
 
 fn get_scenario(name: &ScenarioName) -> Box<dyn Scenario> {
     match name {
-        ScenarioName::PoolPayout => Box::new(PoolPayoutScenario),
+        ScenarioName::PoolPayout => Box::new(PoolPayoutScenario::new()),
         ScenarioName::InboundFlood => Box::new(InboundFloodScenario),
         ScenarioName::Bidirectional => Box::new(BidirectionalScenario),
         ScenarioName::Fragmentation => Box::new(FragmentationScenario),
@@ -75,7 +207,18 @@ fn get_scenario(name: &ScenarioName) -> Box<dyn Scenario> {
 
 fn all_scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(PoolPayoutScenario),
+        Box::new(PoolPayoutScenario::new()),
+        Box::new(InboundFloodScenario),
+        Box::new(BidirectionalScenario),
+        Box::new(FragmentationScenario),
+        Box::new(LockContentionScenario),
+    ]
+}
+
+/// Pool mode: same scenarios but pool_payout uses batch sends (payment processor pattern).
+fn all_scenarios_pool_mode() -> Vec<Box<dyn Scenario>> {
+    vec![
+        Box::new(PoolPayoutScenario::new().with_batch_size(50)),
         Box::new(InboundFloodScenario),
         Box::new(BidirectionalScenario),
         Box::new(FragmentationScenario),
@@ -301,7 +444,10 @@ async fn ensure_utxos(
             Err(e) => {
                 let msg = e.to_string();
                 let msg_lower = msg.to_lowercase();
-                if msg_lower.contains("fundspending") || msg_lower.contains("funds") || msg_lower.contains("pending") {
+                if msg_lower.contains("fundspending")
+                    || msg_lower.contains("funds")
+                    || msg_lower.contains("pending")
+                {
                     if split_start.elapsed() > max_wait {
                         return Err(e.context("Timed out waiting for funds to settle before split"));
                     }
@@ -393,7 +539,10 @@ async fn run_all_scenarios_for_wallet(
     let fee_tolerance = 1_000_000; // 1 tXTM
 
     println!("\n========================================");
-    println!("  {}: Running all 5 scenarios", wallet.name().to_uppercase());
+    println!(
+        "  {}: Running all 5 scenarios",
+        wallet.name().to_uppercase()
+    );
     println!("  1. pool-payout     (~5 min)");
     println!("  2. inbound-flood   (~5 min)");
     println!("  3. bidirectional   (~31 min)");
@@ -409,13 +558,9 @@ async fn run_all_scenarios_for_wallet(
             i + 1,
             scenarios.len()
         );
-        run_scenario_for_wallet(scenario.as_ref(), wallet, address_pool, config, collector)
-            .await?;
+        run_scenario_for_wallet(scenario.as_ref(), wallet, address_pool, config, collector).await?;
 
-        info!(
-            "Running inter-scenario checkpoint for {}...",
-            wallet.name()
-        );
+        info!("Running inter-scenario checkpoint for {}...", wallet.name());
         Reconciler::checkpoint(
             wallet,
             initial_balance,
@@ -558,11 +703,10 @@ async fn run_setup(setup_config: &config::SetupConfig) -> anyhow::Result<()> {
         let cipher_seed = if let Some(state) = SetupState::load() {
             if !state.new_wallet_seed_words.is_empty() {
                 info!("Restoring wallet from existing seed words in setup.json");
-                let seed_words_parsed =
-                    tari_common_types::seeds::seed_words::SeedWords::from_str(
-                        &state.new_wallet_seed_words,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Invalid seed words in setup.json: {}", e))?;
+                let seed_words_parsed = tari_common_types::seeds::seed_words::SeedWords::from_str(
+                    &state.new_wallet_seed_words,
+                )
+                .map_err(|e| anyhow::anyhow!("Invalid seed words in setup.json: {}", e))?;
                 use tari_common_types::seeds::mnemonic::Mnemonic;
                 CipherSeed::from_mnemonic(&seed_words_parsed, None)
                     .map_err(|e| anyhow::anyhow!("Failed to restore seed: {}", e))?
@@ -603,15 +747,22 @@ async fn run_setup(setup_config: &config::SetupConfig) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // --- Step 2: Connect to old wallet and get its address ---
-    info!(
-        "Connecting to old wallet at {}...",
-        setup_config.old_wallet_grpc
-    );
-    let old_wallet = OldWalletDriver::new(setup_config.old_wallet_grpc.clone(), 5);
-    let old_address = old_wallet.get_address().await.context(
-        "Failed to connect to old wallet. Is minotari_console_wallet running with --grpc-enabled?",
-    )?;
+    // --- Step 2: Spawn old wallet process and get its address ---
+    info!("Spawning old wallet process...");
+    let process_config = OldWalletProcessConfig {
+        binary_path: setup_config.old_wallet_binary.clone(),
+        base_dir: setup_config.old_wallet_base_dir.clone(),
+        grpc_port: setup_config.old_wallet_grpc_port,
+        network: setup_config.network.clone(),
+        seed_words: seed_words_str.clone(),
+        password: String::new(),
+    };
+    let old_process = OldWalletProcess::spawn(&process_config).await?;
+    let old_wallet = OldWalletDriver::new(old_process.grpc_addr.clone(), 5);
+    let old_address = old_wallet
+        .get_address()
+        .await
+        .context("Failed to get address from spawned old wallet process")?;
 
     // --- Step 3: Resolve base node URL ---
     let resolved_base_node_url = setup_config
@@ -647,7 +798,8 @@ async fn run_setup(setup_config: &config::SetupConfig) -> anyhow::Result<()> {
     // --- Step 5: Save setup state ---
 
     let state = SetupState {
-        old_wallet_grpc: setup_config.old_wallet_grpc.clone(),
+        old_wallet_grpc: old_process.grpc_addr.clone(),
+        old_wallet_binary: setup_config.old_wallet_binary.to_string_lossy().to_string(),
         new_wallet_db: db_path.to_string_lossy().to_string(),
         new_wallet_seed_words: seed_words_str,
         base_node_url: resolved_base_node_url.clone(),
@@ -727,6 +879,9 @@ async fn run_setup(setup_config: &config::SetupConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Shut down the old wallet process — it will be re-spawned by run commands
+    drop(old_process);
+
     // --- Step 6: Generate address pool ---
     let pool_path = setup_config.data_dir.join("address_pool.json");
     if pool_path.exists() {
@@ -766,31 +921,20 @@ async fn main() -> anyhow::Result<()> {
 
         Command::RunAll { wallet_config } => {
             let address_pool = init_address_pool(&wallet_config)?;
-            let (old, new) = create_drivers(&wallet_config)?;
-            let old = Arc::new(old);
-            let new = Arc::new(new);
 
-            // Start system monitors
+            // === Old wallet: fresh scan + scenarios ===
+            let (_old_process, old) = measure_old_wallet_scan(&wallet_config, &collector).await?;
+            let old = Arc::new(old);
+
             let (old_cancel_tx, old_cancel_rx) = tokio::sync::watch::channel(false);
-            let (new_cancel_tx, new_cancel_rx) = tokio::sync::watch::channel(false);
             let old_monitor = SystemMonitor::start(
                 30,
                 collector.clone(),
                 old.clone() as Arc<dyn WalletDriver>,
                 old_cancel_rx,
             );
-            let new_monitor = SystemMonitor::start(
-                30,
-                collector.clone(),
-                new.clone() as Arc<dyn WalletDriver>,
-                new_cancel_rx,
-            );
 
-            // Baseline — capture initial balances for reconciliation
-            let (old_initial, new_initial) =
-                run_baseline(&old, &new, &address_pool, &wallet_config, &collector).await?;
-
-            // Run old wallet, write intermediate report
+            let old_initial = old.get_balance().await?.available;
             run_all_scenarios_for_wallet(
                 old.as_ref(),
                 old_initial,
@@ -802,7 +946,23 @@ async fn main() -> anyhow::Result<()> {
             Reporter::write_reports(&collector, &cli.output_dir.join("old_wallet"))?;
             Reporter::print_comparison(&collector);
 
-            // Run new wallet, write intermediate report
+            let _ = old_cancel_tx.send(true);
+            let _ = old_monitor.await;
+            // _old_process dropped here, killing the wallet process
+
+            // === New wallet: fresh scan + scenarios ===
+            let new = measure_new_wallet_scan(&wallet_config, &collector).await?;
+            let new = Arc::new(new);
+
+            let (new_cancel_tx, new_cancel_rx) = tokio::sync::watch::channel(false);
+            let new_monitor = SystemMonitor::start(
+                30,
+                collector.clone(),
+                new.clone() as Arc<dyn WalletDriver>,
+                new_cancel_rx,
+            );
+
+            let new_initial = new.get_balance().await?.available;
             run_all_scenarios_for_wallet(
                 new.as_ref(),
                 new_initial,
@@ -812,10 +972,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            // Stop system monitors
-            let _ = old_cancel_tx.send(true);
             let _ = new_cancel_tx.send(true);
-            let _ = old_monitor.await;
             let _ = new_monitor.await;
 
             // Final combined reports
@@ -825,7 +982,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::RunOld { wallet_config } => {
             let address_pool = init_address_pool(&wallet_config)?;
-            let (old, _new) = create_drivers(&wallet_config)?;
+
+            let (_old_process, old) = measure_old_wallet_scan(&wallet_config, &collector).await?;
             let old = Arc::new(old);
 
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -836,9 +994,7 @@ async fn main() -> anyhow::Result<()> {
                 cancel_rx,
             );
 
-            old.sync_blockchain().await?;
             let initial_balance = old.get_balance().await?.available;
-
             run_all_scenarios_for_wallet(
                 old.as_ref(),
                 initial_balance,
@@ -857,7 +1013,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::RunNew { wallet_config } => {
             let address_pool = init_address_pool(&wallet_config)?;
-            let (_old, new) = create_drivers(&wallet_config)?;
+
+            let new = measure_new_wallet_scan(&wallet_config, &collector).await?;
             let new = Arc::new(new);
 
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -868,10 +1025,7 @@ async fn main() -> anyhow::Result<()> {
                 cancel_rx,
             );
 
-            info!("=== Syncing new wallet ===");
-            new.sync_to_tip().await?;
             let initial_balance = new.get_balance().await?.available;
-
             run_all_scenarios_for_wallet(
                 new.as_ref(),
                 initial_balance,
@@ -893,11 +1047,10 @@ async fn main() -> anyhow::Result<()> {
             wallet_config,
         } => {
             let address_pool = init_address_pool(&wallet_config)?;
-            let (old, new) = create_drivers(&wallet_config)?;
-
             let scenario = get_scenario(&scenario);
 
-            // Run on old wallet first, then new wallet (sequential)
+            // Old wallet: fresh scan + scenario
+            let (_old_process, old) = measure_old_wallet_scan(&wallet_config, &collector).await?;
             run_scenario_for_wallet(
                 scenario.as_ref(),
                 &old,
@@ -906,7 +1059,10 @@ async fn main() -> anyhow::Result<()> {
                 &collector,
             )
             .await?;
+            drop(_old_process); // kill old wallet process
 
+            // New wallet: fresh scan + scenario
+            let new = measure_new_wallet_scan(&wallet_config, &collector).await?;
             run_scenario_for_wallet(
                 scenario.as_ref(),
                 &new,
@@ -922,12 +1078,20 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Baseline { wallet_config } => {
             let address_pool = init_address_pool(&wallet_config)?;
-            let (old, new) = create_drivers(&wallet_config)?;
+
+            let (_old_process, old) = measure_old_wallet_scan(&wallet_config, &collector).await?;
+            let new = measure_new_wallet_scan(&wallet_config, &collector).await?;
+
             run_baseline(&old, &new, &address_pool, &wallet_config, &collector).await?;
+
+            Reporter::print_comparison(&collector);
         }
 
         Command::Consolidate { wallet_config } => {
-            let (old, new) = create_drivers(&wallet_config)?;
+            // Consolidate uses existing wallets (no fresh scan needed)
+            let (_old_process, old) = measure_old_wallet_scan(&wallet_config, &collector).await?;
+            let new = create_new_driver(&wallet_config)?;
+            new.sync_to_tip().await?;
 
             info!("Consolidating old wallet...");
             Consolidator::consolidate(&old, wallet_config.confirmation_wait_secs()).await?;
@@ -949,15 +1113,78 @@ async fn main() -> anyhow::Result<()> {
             info!("Consolidation complete");
         }
 
+        Command::RunPool { wallet_config } => {
+            let address_pool = init_address_pool(&wallet_config)?;
+
+            let new = measure_new_wallet_scan(&wallet_config, &collector).await?;
+            let new = Arc::new(new);
+
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let monitor = SystemMonitor::start(
+                30,
+                collector.clone(),
+                new.clone() as Arc<dyn WalletDriver>,
+                cancel_rx,
+            );
+
+            let initial_balance = new.get_balance().await?.available;
+
+            println!("\n========================================");
+            println!("  POOL MODE: Payment Processor Pattern");
+            println!("  Same scenarios, pool_payout uses batch 1-to-many sends");
+            println!("========================================\n");
+
+            let scenarios = all_scenarios_pool_mode();
+            let fee_tolerance = 1_000_000;
+
+            for (i, scenario) in scenarios.iter().enumerate() {
+                println!(
+                    "--- {}: scenario {}/{} ({}) ---",
+                    new.name(),
+                    i + 1,
+                    scenarios.len(),
+                    scenario.name()
+                );
+                run_scenario_for_wallet(
+                    scenario.as_ref(),
+                    new.as_ref(),
+                    &address_pool,
+                    &wallet_config,
+                    &collector,
+                )
+                .await?;
+
+                info!("Running inter-scenario checkpoint for {}...", new.name());
+                Reconciler::checkpoint(
+                    new.as_ref(),
+                    initial_balance,
+                    &collector,
+                    wallet_config.confirmation_wait_secs(),
+                    fee_tolerance,
+                )
+                .await?;
+            }
+
+            let _ = cancel_tx.send(true);
+            let _ = monitor.await;
+
+            Reporter::write_reports(&collector, &cli.output_dir.join("pool"))?;
+            Reporter::print_comparison(&collector);
+        }
+
         Command::Sync { wallet_config } => {
-            let (_old, new) = create_drivers(&wallet_config)?;
+            let new = create_new_driver(&wallet_config)?;
             info!("=== Syncing new wallet ===");
             new.sync_to_tip().await?;
             let balance = new.get_balance().await?;
             println!("\n========================================");
             println!("  WALLET BALANCE");
             println!("========================================");
-            println!("  Available:    {} µT ({} tXTM)", balance.available, balance.available / 1_000_000);
+            println!(
+                "  Available:    {} µT ({} tXTM)",
+                balance.available,
+                balance.available / 1_000_000
+            );
             println!("  Pending in:   {} µT", balance.pending_incoming);
             println!("  Locked:       {} µT", balance.locked);
             println!("========================================\n");
@@ -1008,10 +1235,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  Registered {} new pool accounts", registered);
 
             // Step 2: Scan pool accounts to discover outputs
-            println!(
-                "  Scanning {} pool accounts for outputs...",
-                entries.len()
-            );
+            println!("  Scanning {} pool accounts for outputs...", entries.len());
             println!("  (Each account creates an HTTP connection + scans ~30 blocks)");
             Drainer::scan_pool_accounts(
                 &wallet_config.new_wallet_db,

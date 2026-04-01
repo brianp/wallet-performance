@@ -33,6 +33,11 @@ pub struct LoadGenerator;
 
 impl LoadGenerator {
     /// Execute a load pattern against a wallet driver.
+    ///
+    /// When `batch_size > 1`, recipients are collected and sent via
+    /// `send_batch_transaction` (payment processor pattern). The total
+    /// number of recipients is the same either way, so results are comparable.
+    /// When `batch_size == 1`, sends individually via `send_transaction` (user pattern).
     pub async fn execute(
         pattern: &LoadPattern,
         wallet: &dyn WalletDriver,
@@ -41,30 +46,76 @@ impl LoadGenerator {
         scenario_name: &str,
         collector: &MetricsCollector,
     ) -> anyhow::Result<Vec<SendResult>> {
+        Self::execute_with_batch(
+            pattern,
+            wallet,
+            address_pool,
+            amount,
+            scenario_name,
+            collector,
+            1,
+        )
+        .await
+    }
+
+    pub async fn execute_with_batch(
+        pattern: &LoadPattern,
+        wallet: &dyn WalletDriver,
+        address_pool: &AddressPool,
+        amount: u64,
+        scenario_name: &str,
+        collector: &MetricsCollector,
+        batch_size: usize,
+    ) -> anyhow::Result<Vec<SendResult>> {
         match pattern {
             LoadPattern::Constant { tps, duration_secs } => {
-                let interval = Duration::from_secs_f64(1.0 / tps);
                 let deadline = Instant::now() + Duration::from_secs(*duration_secs);
                 let mut results = Vec::new();
 
-                info!(
-                    "[{}] Constant load: {:.1} TPS for {}s",
-                    wallet.name(),
-                    tps,
-                    duration_secs
-                );
-
-                while Instant::now() < deadline {
-                    let result = Self::send_and_record(
-                        wallet,
-                        address_pool.next_address(),
-                        amount,
-                        scenario_name,
-                        collector,
-                    )
-                    .await;
-                    results.push(result);
-                    sleep(interval).await;
+                if batch_size <= 1 {
+                    let interval = Duration::from_secs_f64(1.0 / tps);
+                    info!(
+                        "[{}] Constant load: {:.1} TPS for {}s (1-to-1)",
+                        wallet.name(),
+                        tps,
+                        duration_secs
+                    );
+                    while Instant::now() < deadline {
+                        let result = Self::send_and_record(
+                            wallet,
+                            address_pool.next_address(),
+                            amount,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
+                        sleep(interval).await;
+                    }
+                } else {
+                    // Batch mode: send `batch_size` recipients per tx at adjusted rate
+                    let batch_interval = Duration::from_secs_f64(batch_size as f64 / tps);
+                    info!(
+                        "[{}] Constant load: {:.1} TPS for {}s (batches of {})",
+                        wallet.name(),
+                        tps,
+                        duration_secs,
+                        batch_size
+                    );
+                    while Instant::now() < deadline {
+                        let recipients: Vec<(&str, u64)> = (0..batch_size)
+                            .map(|_| (address_pool.next_address(), amount))
+                            .collect();
+                        let result = Self::send_batch_and_record(
+                            wallet,
+                            &recipients,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
+                        sleep(batch_interval).await;
+                    }
                 }
 
                 Ok(results)
@@ -98,17 +149,34 @@ impl LoadGenerator {
                         debug!("Ramp: TPS increased to {:.1}", current_tps);
                     }
 
-                    let interval = Duration::from_secs_f64(1.0 / current_tps);
-                    let result = Self::send_and_record(
-                        wallet,
-                        address_pool.next_address(),
-                        amount,
-                        scenario_name,
-                        collector,
-                    )
-                    .await;
-                    results.push(result);
-                    sleep(interval).await;
+                    if batch_size <= 1 {
+                        let interval = Duration::from_secs_f64(1.0 / current_tps);
+                        let result = Self::send_and_record(
+                            wallet,
+                            address_pool.next_address(),
+                            amount,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
+                        sleep(interval).await;
+                    } else {
+                        let batch_interval =
+                            Duration::from_secs_f64(batch_size as f64 / current_tps);
+                        let recipients: Vec<(&str, u64)> = (0..batch_size)
+                            .map(|_| (address_pool.next_address(), amount))
+                            .collect();
+                        let result = Self::send_batch_and_record(
+                            wallet,
+                            &recipients,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
+                        sleep(batch_interval).await;
+                    }
                 }
 
                 Ok(results)
@@ -116,21 +184,54 @@ impl LoadGenerator {
             LoadPattern::Burst { count } => {
                 let mut results = Vec::new();
 
-                info!("[{}] Burst load: {} transactions", wallet.name(), count);
-
-                for i in 0..*count {
-                    let result = Self::send_and_record(
-                        wallet,
-                        address_pool.next_address(),
-                        amount,
-                        scenario_name,
-                        collector,
-                    )
-                    .await;
-                    if !result.accepted {
-                        warn!("Burst tx {} failed: {:?}", i, result.error);
+                if batch_size <= 1 {
+                    info!(
+                        "[{}] Burst load: {} transactions (1-to-1)",
+                        wallet.name(),
+                        count
+                    );
+                    for i in 0..*count {
+                        let result = Self::send_and_record(
+                            wallet,
+                            address_pool.next_address(),
+                            amount,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        if !result.accepted {
+                            warn!("Burst tx {} failed: {:?}", i, result.error);
+                        }
+                        results.push(result);
                     }
-                    results.push(result);
+                } else {
+                    let num_batches = (*count as usize).div_ceil(batch_size);
+                    let mut sent = 0u64;
+                    info!(
+                        "[{}] Burst load: {} recipients in {} batches of {}",
+                        wallet.name(),
+                        count,
+                        num_batches,
+                        batch_size
+                    );
+                    for i in 0..num_batches {
+                        let this_batch = batch_size.min((*count - sent) as usize);
+                        let recipients: Vec<(&str, u64)> = (0..this_batch)
+                            .map(|_| (address_pool.next_address(), amount))
+                            .collect();
+                        let result = Self::send_batch_and_record(
+                            wallet,
+                            &recipients,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        if !result.accepted {
+                            warn!("Burst batch {} failed: {:?}", i, result.error);
+                        }
+                        sent += this_batch as u64;
+                        results.push(result);
+                    }
                 }
 
                 Ok(results)
@@ -151,24 +252,41 @@ impl LoadGenerator {
                 );
 
                 while Instant::now() < deadline {
-                    // Exponential distribution for inter-arrival times
                     let u: f64 = rng.gen_range(0.001..1.0);
-                    let wait_secs = -u.ln() / avg_tps;
-                    sleep(Duration::from_secs_f64(wait_secs)).await;
 
-                    if Instant::now() >= deadline {
-                        break;
+                    if batch_size <= 1 {
+                        let wait_secs = -u.ln() / avg_tps;
+                        sleep(Duration::from_secs_f64(wait_secs)).await;
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let result = Self::send_and_record(
+                            wallet,
+                            address_pool.next_address(),
+                            amount,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
+                    } else {
+                        let wait_secs = -u.ln() / (avg_tps / batch_size as f64);
+                        sleep(Duration::from_secs_f64(wait_secs)).await;
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let recipients: Vec<(&str, u64)> = (0..batch_size)
+                            .map(|_| (address_pool.next_address(), amount))
+                            .collect();
+                        let result = Self::send_batch_and_record(
+                            wallet,
+                            &recipients,
+                            scenario_name,
+                            collector,
+                        )
+                        .await;
+                        results.push(result);
                     }
-
-                    let result = Self::send_and_record(
-                        wallet,
-                        address_pool.next_address(),
-                        amount,
-                        scenario_name,
-                        collector,
-                    )
-                    .await;
-                    results.push(result);
                 }
 
                 Ok(results)
@@ -215,6 +333,51 @@ impl LoadGenerator {
             amount,
             fee: send_result.fee,
             tx_type: "send".to_string(),
+        });
+
+        send_result
+    }
+
+    async fn send_batch_and_record(
+        wallet: &dyn WalletDriver,
+        recipients: &[(&str, u64)],
+        scenario_name: &str,
+        collector: &MetricsCollector,
+    ) -> SendResult {
+        let total_amount: u64 = recipients.iter().map(|(_, a)| a).sum();
+        let recipient_count = recipients.len();
+        let start = Utc::now();
+        let timer = Instant::now();
+
+        let result = wallet.send_batch_transaction(recipients).await;
+        let duration = timer.elapsed();
+        let end = Utc::now();
+
+        let (send_result, error) = match result {
+            Ok(r) => (r, None),
+            Err(e) => (
+                SendResult {
+                    tx_id: String::new(),
+                    accepted: false,
+                    error: Some(e.to_string()),
+                    fee: None,
+                },
+                Some(e.to_string()),
+            ),
+        };
+
+        collector.record_transaction(TransactionRecord {
+            wallet: wallet.name().to_string(),
+            scenario: scenario_name.to_string(),
+            tx_id: send_result.tx_id.clone(),
+            start_time: start,
+            end_time: end,
+            duration_ms: duration.as_millis() as u64,
+            accepted: send_result.accepted,
+            error: send_result.error.clone().or(error),
+            amount: total_amount,
+            fee: send_result.fee,
+            tx_type: format!("batch_{}", recipient_count),
         });
 
         send_result

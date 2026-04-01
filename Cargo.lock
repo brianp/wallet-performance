@@ -1145,6 +1145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs-next"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b98cf8ebf19c3d1b223e151f99a4f9f0690dca41414773390fc824184ac833e1"
+dependencies = [
+ "cfg-if",
+ "dirs-sys-next",
+]
+
+[[package]]
 name = "dirs-sys-next"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,7 +1912,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -2546,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "minotari"
 version = "0.1.0"
-source = "git+https://github.com/tari-project/minotari-cli.git?rev=4dc6c0d#4dc6c0df8045ae638c1fd6c930d2210551d183a6"
+source = "git+https://github.com/tari-project/minotari-cli.git?rev=5402a13#5402a13437ff2a05c096f7e72160059133689fa2"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -2555,6 +2565,7 @@ dependencies = [
  "chrono",
  "clap 4.5.60",
  "config",
+ "dirs-next 2.0.0",
  "hex",
  "hmac",
  "include_dir",
@@ -2578,6 +2589,7 @@ dependencies = [
  "tari_common_types",
  "tari_crypto",
  "tari_script",
+ "tari_sidechain",
  "tari_transaction_components",
  "tari_utilities",
  "thiserror 2.0.18",
@@ -2592,7 +2604,7 @@ dependencies = [
 [[package]]
 name = "minotari-scanning"
 version = "0.1.0"
-source = "git+https://github.com/tari-project/minotari-cli.git?rev=4dc6c0d#4dc6c0df8045ae638c1fd6c930d2210551d183a6"
+source = "git+https://github.com/tari-project/minotari-cli.git?rev=5402a13#5402a13437ff2a05c096f7e72160059133689fa2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4633,7 +4645,7 @@ dependencies = [
  "anyhow",
  "cargo_toml",
  "config",
- "dirs-next",
+ "dirs-next 1.0.2",
  "log",
  "log4rs",
  "multiaddr",
@@ -4813,7 +4825,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "digest",
- "dirs-next",
+ "dirs-next 1.0.2",
  "fs2",
  "futures",
  "hex",
@@ -5853,6 +5865,7 @@ dependencies = [
  "clap 4.5.60",
  "csv",
  "env_logger",
+ "libc",
  "log",
  "minotari",
  "minotari-scanning",
@@ -6120,7 +6133,7 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
 dependencies = [
- "windows-core 0.57.0",
+ "windows-core",
  "windows-targets 0.52.6",
 ]
 
@@ -6130,23 +6143,10 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
 dependencies = [
- "windows-implement 0.57.0",
- "windows-interface 0.57.0",
+ "windows-implement",
+ "windows-interface",
  "windows-result 0.1.2",
  "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link",
- "windows-result 0.4.1",
- "windows-strings",
 ]
 
 [[package]]
@@ -6161,32 +6161,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "windows-interface"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",

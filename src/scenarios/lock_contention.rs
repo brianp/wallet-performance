@@ -55,11 +55,7 @@ impl Scenario for LockContentionScenario {
         let send_amount = 50_000_000u64; // 50 tXTM
 
         for batch_size in batch_sizes {
-            println!(
-                "  [{}] Batch: {} rapid sends...",
-                wallet.name(),
-                batch_size
-            );
+            println!("  [{}] Batch: {} rapid sends...", wallet.name(), batch_size);
 
             for _ in 0..batch_size {
                 let start = Utc::now();

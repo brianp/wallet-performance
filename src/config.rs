@@ -70,6 +70,11 @@ pub enum Command {
         #[command(flatten)]
         wallet_config: WalletConfig,
     },
+    /// Run pool/payment-processor scenarios on new wallet (batch 1-to-many transactions)
+    RunPool {
+        #[command(flatten)]
+        wallet_config: WalletConfig,
+    },
     /// Sync the new wallet to chain tip and print balance
     Sync {
         #[command(flatten)]
@@ -90,9 +95,17 @@ pub enum Command {
 /// Configuration for the setup command (creates wallets automatically).
 #[derive(Clone, Debug, clap::Args)]
 pub struct SetupConfig {
-    /// Old wallet gRPC address (must already be running)
-    #[arg(long, default_value = "http://127.0.0.1:18143")]
-    pub old_wallet_grpc: String,
+    /// Path to the minotari_console_wallet binary
+    #[arg(long, default_value = "minotari_console_wallet")]
+    pub old_wallet_binary: PathBuf,
+
+    /// Base directory for old wallet data
+    #[arg(long, default_value = "data/old_wallet")]
+    pub old_wallet_base_dir: PathBuf,
+
+    /// gRPC port for managed old wallet process
+    #[arg(long, default_value_t = 18143)]
+    pub old_wallet_grpc_port: u16,
 
     /// Base node HTTP RPC URL for broadcasting transactions (new wallet).
     /// Defaults to the public RPC for the selected network.
@@ -129,6 +142,8 @@ pub enum ScenarioName {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SetupState {
     pub old_wallet_grpc: String,
+    #[serde(default)]
+    pub old_wallet_binary: String,
     pub new_wallet_db: String,
     pub new_wallet_seed_words: String,
     pub base_node_url: String,
@@ -162,6 +177,18 @@ pub struct WalletConfig {
     /// Old wallet gRPC address (uses single-call Transfer RPC)
     #[arg(long, default_value = "http://127.0.0.1:18143")]
     pub old_wallet_grpc: String,
+
+    /// Path to the minotari_console_wallet binary (for process management)
+    #[arg(long, default_value = "minotari_console_wallet")]
+    pub old_wallet_binary: PathBuf,
+
+    /// Base directory for old wallet data (deleted and recreated for fresh scans)
+    #[arg(long, default_value = "data/old_wallet")]
+    pub old_wallet_base_dir: PathBuf,
+
+    /// gRPC port for managed old wallet process
+    #[arg(long, default_value_t = 18143)]
+    pub old_wallet_grpc_port: u16,
 
     /// Fee per gram in MicroMinotari (old wallet)
     #[arg(long, default_value_t = 5)]
